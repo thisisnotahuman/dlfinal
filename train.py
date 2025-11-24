@@ -136,6 +136,7 @@ def train_ssl(
         print(f"   lr = {current_lr:.3e}")
         
         # 保存 checkpoint
+        # 保存 checkpoint
         if epoch % save_freq == 0 or epoch == epochs:
             ckpt = {
                 "epoch": epoch,
@@ -153,9 +154,10 @@ def train_ssl(
                 )
             
             save_path = os.path.join(save_dir, f"epoch_{epoch:03d}.pth")
-            save_checkpoint(save_path, epoch, method, optimizer, scheduler, **ckpt)
+            # ⬅️ 直接保存 ckpt，不再传 epoch, method, optimizer, scheduler
+            torch.save(ckpt, save_path)
             print(f"💾 保存模型到 {save_path}")
-        
+
         # 保存 best 模型
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -323,4 +325,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
