@@ -1,3 +1,4 @@
+# bababoi
 # 通用自监督学习框架
 
 这是一个模块化的自监督学习框架，支持多种方法（SimCLR, MoCo, BYOL, DINO, iBOT, VICReg, MAE等）的统一训练和评估。
