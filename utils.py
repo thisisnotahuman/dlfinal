@@ -192,4 +192,3 @@ def load_checkpoint(load_path, model, optimizer=None, scheduler=None, device=Non
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     
     return checkpoint.get("epoch", 0), checkpoint
-
