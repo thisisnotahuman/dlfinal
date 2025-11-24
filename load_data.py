@@ -220,86 +220,117 @@ def collate_fn_cpu(batch):
 # 5. DataLoader 主函数
 # ============================================================
 
+import os
+import time
+from glob import glob
+from torch.utils.data import Dataset, DataLoader, Subset
+from PIL import Image
+import torch
+import random
+
+# =============================
+# 本地文件 Dataset
+# =============================
+class LocalImageDataset(Dataset):
+    def __init__(self, root_dir, base_transform):
+        self.paths = []
+        for ext in ["jpg", "jpeg", "png"]:
+            self.paths.extend(glob(os.path.join(root_dir, f"*.{ext}")))
+        self.paths.sort()
+        self.base_transform = base_transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img = Image.open(path).convert("RGB")
+        x = self.base_transform(img)   # [3,H,W]
+        return x
+
+
+# =============================
+# 高性能本地 DataLoader
+# =============================
 def load_dino_data(
-    dataset_name="tsbpp/fall2025_deeplearning",
-    dataset_type="huggingface",
+    dataset_root="/content/drive/MyDrive/fall2025_data/images",
     img_size=96,
     batch_size=64,
     num_workers=8,
-    train_sample=None,      # ⭐ 新增参数：子集大小
-    eval_samples=None,      #（不影响训练）
+    train_sample=None,
     strength="strong",
+    dataset_type="local"
 ):
+    """
+    dataset_root: 本地图片文件夹路径
+    """
+
     print("=" * 60)
-    print("⚡ Loading dataset with GPU-optimized pipeline")
+    print("⚡ Loading LOCAL dataset with GPU-optimized pipeline")
     print("=" * 60)
 
     rng = random.Random(42)
 
     # --------------------------------------------------------
-    # 读取数据集
+    # 读取本地所有图片
     # --------------------------------------------------------
+    img_paths = []
+    for ext in ["jpg", "jpeg", "png"]:
+        img_paths.extend(glob(os.path.join(dataset_root, f"*.{ext}")))
+    img_paths.sort()
 
-    if dataset_type == "huggingface":
-        dataset = load_dataset(dataset_name)
-        base_train = dataset["train"]
-        print(f"✔ HF dataset loaded: {len(base_train)} images")
-
-    elif dataset_type == "cifar10":
-        from torchvision.datasets import CIFAR10
-        base_train = CIFAR10("./data", train=True, download=True)
-        print(f"✔ CIFAR10 loaded: {len(base_train)} images")
-
-    elif dataset_type == "cifar100":
-        from torchvision.datasets import CIFAR100
-        base_train = CIFAR100("./data", train=True, download=True)
-        print(f"✔ CIFAR100 loaded: {len(base_train)} images")
-
-    else:
-        raise ValueError("Unknown dataset_type")
+    total_imgs = len(img_paths)
+    print(f"✔ Found {total_imgs} local images")
 
     # --------------------------------------------------------
-    # train_sample 逻辑
+    # train_sample
     # --------------------------------------------------------
-
     if train_sample is not None:
         train_sample = int(train_sample)
-        total = len(base_train)
-        use_n = min(train_sample, total)
-        idxs = rng.sample(range(total), use_n)
-        base_train = Subset(base_train, idxs)
-        print(f"✔ Using train subset: {use_n}/{total} images")
+        use_n = min(train_sample, total_imgs)
+        idxs = rng.sample(range(total_imgs), use_n)
+        img_paths_subset = [img_paths[i] for i in idxs]
+        print(f"✔ Using subset: {use_n}/{total_imgs} images")
     else:
-        print(f"✔ Using full train set: {len(base_train)} images")
+        img_paths_subset = img_paths
+        idxs = list(range(total_imgs))
+        print(f"✔ Using full local dataset: {total_imgs} images")
 
     # --------------------------------------------------------
-    # 构建 transform 和 augment
+    # transform + augment
     # --------------------------------------------------------
-
     base_transform = ms_transform(img_size)
     two_view_aug = build_two_view_augment(img_size, strength)
 
-    train_dataset = DINODatasetGPU(base_train, base_transform)
+    # Dataset
+    full_dataset = LocalImageDataset(dataset_root, base_transform)
+
+    # Subset if needed
+    if train_sample is not None:
+        train_dataset = Subset(full_dataset, idxs)
+    else:
+        train_dataset = full_dataset
 
     # --------------------------------------------------------
-    # 创建 DataLoader（GPU augment + 高速线程）
+    # DataLoader
     # --------------------------------------------------------
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,     # 极速
+        num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=4,
         drop_last=True,
-        collate_fn=collate_fn_cpu,  # 只在 CPU 上堆叠，不操作 CUDA
+        collate_fn=collate_fn_cpu,
     )
 
     print(f"✔ Train loader created: {len(train_loader)} batches")
     print("=" * 60)
 
     return train_loader, None, base_transform, two_view_aug
+
+
 
 
 # ============================================================
