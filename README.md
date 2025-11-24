@@ -153,3 +153,14 @@ class MyMethod(BaseSSLMethod):
 python prepare_cub200_for_kaggle.py --download_dir ./raw_data --output_dir ./data
 
 ```
+
+## 跑test
+```python
+python run_eval.py \
+    --checkpoint ./checkpoints/best.pth \
+    --data_dir ./data \
+    --method simclr \
+    --backbone_type resnet50 \
+    --eval_method knn \
+    --knn_k 20
+```
