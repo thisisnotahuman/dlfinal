@@ -11,7 +11,7 @@ from datetime import datetime
 import torch
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-
+import wandb 
 from load_data import load_dino_data
 from model import build_method
 from utils import (
@@ -34,10 +34,13 @@ def train_ssl(
     scheduler,
     epochs,
     save_dir,
+    two_view_aug,
     use_amp=True,
     save_freq=1,
     log_freq=100,
-    two_view_aug=None  # 增强函数
+    use_wandb=False,  # ⬅️ 添加这个参数
+    wandb_project="ssl-pretraining",  # ⬅️ 添加这个参数
+    wandb_name=None  # ⬅️ 添加这个参数
 ):
     """
     通用自监督学习训练循环
@@ -50,9 +53,13 @@ def train_ssl(
         scheduler: 学习率调度器
         epochs: 训练轮数
         save_dir: 保存目录
+        two_view_aug: 数据增强函数
         use_amp: 是否使用自动混合精度
         save_freq: 保存频率（每 N 个 epoch）
         log_freq: 日志频率（每 N 个 step）
+        use_wandb: 是否使用 wandb 监控
+        wandb_project: wandb 项目名
+        wandb_name: wandb 运行名称
     """
     os.makedirs(save_dir, exist_ok=True)
     
@@ -63,6 +70,8 @@ def train_ssl(
     print(f"   参数量: {count_parameters(method):,}")
     print(f"   设备: {device}")
     print(f"   AMP: {use_amp}")
+    if use_wandb:
+        print(f"   Wandb: ✅ {wandb_project}/{wandb_name}")
     print()
     
     global_step = 0
@@ -78,26 +87,27 @@ def train_ssl(
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", ncols=100)
         
         for batch in pbar:
-            # batch 是 [B, 3, H, W] CPU tensor，需要移到 GPU 并进行增强
-            batch = batch.to(device, non_blocking=True)  # [B, 3, H, W] GPU
-            
-            # 应用增强（生成 views）- 在主进程的 GPU 上进行
-            if two_view_aug is not None:
-                batch = two_view_aug(batch)  # [B, 2, 3, H, W] GPU
+            # 将 batch 移到设备并做增强
+            if isinstance(batch, torch.Tensor):
+                batch = batch.to(device, non_blocking=True)
+                views = two_view_aug(batch)
+            elif isinstance(batch, (list, tuple)):
+                batch = [b.to(device, non_blocking=True) if isinstance(b, torch.Tensor) else b for b in batch]
+                views = method.get_views(batch)
+            else:
+                views = method.get_views(batch)
             
             optimizer.zero_grad()
             
             # 前向传播和损失计算
             if use_amp:
                 with autocast():
-                    views = method.get_views(batch)
                     loss, loss_dict = method.compute_loss(views)
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                views = method.get_views(batch)
                 loss, loss_dict = method.compute_loss(views)
                 loss.backward()
                 optimizer.step()
@@ -105,20 +115,23 @@ def train_ssl(
             # 更新 EMA（如果有 teacher 网络）
             method.update_ema()
             
-            # 更新学习率（某些方法可能需要在 step 级别更新）
-            if hasattr(scheduler, 'step') and callable(getattr(scheduler, 'step', None)):
-                # 检查是否是 epoch 级别的 scheduler
-                if not hasattr(scheduler, 'current_epoch'):
-                    # 如果是 step 级别的，在这里更新
-                    pass  # 暂时不在这里更新，在 epoch 结束后更新
-            
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
             
             # 日志
             if global_step % log_freq == 0:
-                pbar.set_postfix({**loss_dict, "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                current_lr = optimizer.param_groups[0]['lr']
+                pbar.set_postfix({**loss_dict, "lr": f"{current_lr:.2e}"})
+                
+                # ⬇️ Wandb 日志（step级别）
+                if use_wandb:
+                    wandb.log({
+                        "train/loss_step": loss.item(),
+                        "train/lr": current_lr,
+                        "train/epoch": epoch,
+                        **{f"train/{k}": v for k, v in loss_dict.items()}
+                    }, step=global_step)
         
         # Epoch 结束：更新学习率
         if scheduler is not None:
@@ -135,7 +148,14 @@ def train_ssl(
         print(f"   avg_loss = {avg_loss:.4f}")
         print(f"   lr = {current_lr:.3e}")
         
-        # 保存 checkpoint
+        # ⬇️ Wandb 日志（epoch级别）
+        if use_wandb:
+            wandb.log({
+                "train/loss_epoch": avg_loss,
+                "train/lr_epoch": current_lr,
+                "epoch": epoch
+            }, step=global_step)
+        
         # 保存 checkpoint
         if epoch % save_freq == 0 or epoch == epochs:
             ckpt = {
@@ -154,10 +174,13 @@ def train_ssl(
                 )
             
             save_path = os.path.join(save_dir, f"epoch_{epoch:03d}.pth")
-            # ⬅️ 直接保存 ckpt，不再传 epoch, method, optimizer, scheduler
             torch.save(ckpt, save_path)
             print(f"💾 保存模型到 {save_path}")
-
+            
+            # ⬇️ Wandb 保存 checkpoint
+            if use_wandb:
+                wandb.save(save_path)
+        
         # 保存 best 模型
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -177,7 +200,12 @@ def train_ssl(
                 )
             torch.save(ckpt, best_path)
             print(f"🏅 更新 Best 模型（loss={best_loss:.4f}）")
-
+            
+            # ⬇️ Wandb 记录 best loss
+            if use_wandb:
+                wandb.run.summary["best_loss"] = best_loss
+                wandb.run.summary["best_epoch"] = epoch
+                wandb.save(best_path)
 
 # ============================================================
 # 主训练函数
@@ -187,6 +215,31 @@ def main_train(args):
     """主训练函数"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🔥 设备: {device}")
+    
+    # ⬇️ 初始化 wandb
+    if args.use_wandb:
+        wandb_name = args.wandb_name or f"{args.method}_{args.backbone_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        wandb.init(
+            project=args.wandb_project,
+            name=wandb_name,
+            config={
+                "method": args.method,
+                "backbone_type": args.backbone_type,
+                "img_size": args.img_size,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "optimizer_type": args.optimizer_type,
+                "scheduler_type": args.scheduler_type,
+                "warmup_epochs": args.warmup_epochs,
+                "temperature": args.temperature,
+                "proj_hidden_dim": args.proj_hidden_dim,
+                "proj_output_dim": args.proj_output_dim,
+                "aug_strength": args.aug_strength,
+                "train_sample": args.train_sample,
+            }
+        )
     
     # 加载数据
     train_loader, _, _, two_view_aug = load_dino_data(
@@ -200,15 +253,11 @@ def main_train(args):
         strength=args.aug_strength,
     )
     
-    # 将 two_view_aug 存储为全局变量或传递给训练函数
-    # 为了简化，我们修改训练循环来使用它
-    
     # 构建方法配置
     method_config = {
         "proj_hidden_dim": args.proj_hidden_dim,
         "proj_output_dim": args.proj_output_dim,
         "temperature": args.temperature,
-        # 可以添加其他方法特定的配置
     }
     
     # 构建方法
@@ -218,6 +267,10 @@ def main_train(args):
         pretrained_backbone=args.pretrained_backbone,
         config=method_config
     ).to(device)
+    
+    # ⬇️ Wandb watch model（可选，记录梯度和参数）
+    if args.use_wandb and args.wandb_watch:
+        wandb.watch(method, log="all", log_freq=args.log_freq)
     
     # 构建优化器和调度器
     optimizer = build_optimizer(
@@ -243,11 +296,18 @@ def main_train(args):
         scheduler=scheduler,
         epochs=args.epochs,
         save_dir=args.save_dir,
+        two_view_aug=two_view_aug,
         use_amp=args.use_amp,
         save_freq=args.save_freq,
         log_freq=args.log_freq,
-        two_view_aug=two_view_aug  # 传递增强函数
+        use_wandb=args.use_wandb,  # ⬅️ 传入 wandb 参数
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name
     )
+    
+    # ⬇️ 关闭 wandb
+    if args.use_wandb:
+        wandb.finish()
 
 
 # ============================================================
@@ -302,7 +362,14 @@ def parse_args():
                        help="每 N 个 epoch 保存一次")
     parser.add_argument("--log_freq", type=int, default=100,
                        help="每 N 个 step 记录一次日志")
-    
+    parser.add_argument("--use_wandb", action="store_true",
+                       help="使用 Weights & Biases 监控")
+    parser.add_argument("--wandb_project", type=str, default="ssl-pretraining",
+                       help="Wandb 项目名称")
+    parser.add_argument("--wandb_name", type=str, default=None,
+                       help="Wandb 运行名称（默认自动生成）")
+    parser.add_argument("--wandb_watch", action="store_true",
+                       help="Wandb watch 模型（记录梯度，会变慢）")
     return parser.parse_args()
 
 
