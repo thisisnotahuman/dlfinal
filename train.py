@@ -36,7 +36,8 @@ def train_ssl(
     save_dir,
     use_amp=True,
     save_freq=1,
-    log_freq=100
+    log_freq=100,
+    two_view_aug=None  # 增强函数
 ):
     """
     通用自监督学习训练循环
@@ -77,11 +78,12 @@ def train_ssl(
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", ncols=100)
         
         for batch in pbar:
-            # 将 batch 移到设备
-            if isinstance(batch, torch.Tensor):
-                batch = batch.to(device)
-            elif isinstance(batch, (list, tuple)):
-                batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+            # batch 是 [B, 3, H, W] CPU tensor，需要移到 GPU 并进行增强
+            batch = batch.to(device, non_blocking=True)  # [B, 3, H, W] GPU
+            
+            # 应用增强（生成 views）- 在主进程的 GPU 上进行
+            if two_view_aug is not None:
+                batch = two_view_aug(batch)  # [B, 2, 3, H, W] GPU
             
             optimizer.zero_grad()
             
@@ -185,7 +187,7 @@ def main_train(args):
     print(f"🔥 设备: {device}")
     
     # 加载数据
-    train_loader, _, _, _ = load_dino_data(
+    train_loader, _, _, two_view_aug = load_dino_data(
         dataset_name=args.dataset_name,
         dataset_type=args.dataset_type,
         img_size=args.img_size,
@@ -195,6 +197,9 @@ def main_train(args):
         eval_samples=None,
         strength=args.aug_strength,
     )
+    
+    # 将 two_view_aug 存储为全局变量或传递给训练函数
+    # 为了简化，我们修改训练循环来使用它
     
     # 构建方法配置
     method_config = {
@@ -238,7 +243,8 @@ def main_train(args):
         save_dir=args.save_dir,
         use_amp=args.use_amp,
         save_freq=args.save_freq,
-        log_freq=args.log_freq
+        log_freq=args.log_freq,
+        two_view_aug=two_view_aug  # 传递增强函数
     )
 
 

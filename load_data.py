@@ -203,12 +203,17 @@ class DINODatasetGPU(Dataset):
 
 
 # ============================================================
-# 4. collate_fn（批量 GPU 强增强）
+# 4. collate_fn（批量 CPU 堆叠，GPU 增强在主进程进行）
 # ============================================================
 
-def collate_fn_gpu(batch, two_view_aug):
-    x = torch.stack(batch, dim=0).cuda(non_blocking=True)
-    return two_view_aug(x)   # [B,2,3,H,W]
+def collate_fn_cpu(batch):
+    """
+    在 DataLoader worker 中只做 CPU 操作，避免 CUDA 多进程问题
+    GPU 增强将在主进程中进行
+    """
+    # 在 CPU 上堆叠 batch
+    x = torch.stack(batch, dim=0)  # [B, 3, H, W] CPU
+    return x
 
 
 # ============================================================
@@ -288,7 +293,7 @@ def load_dino_data(
         pin_memory=True,
         prefetch_factor=4,
         drop_last=True,
-        collate_fn=lambda b: collate_fn_gpu(b, two_view_aug),
+        collate_fn=collate_fn_cpu,  # 只在 CPU 上堆叠，不操作 CUDA
     )
 
     print(f"✔ Train loader created: {len(train_loader)} batches")
