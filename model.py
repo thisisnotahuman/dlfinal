@@ -102,7 +102,7 @@ class SimCLR(BaseSSLMethod):
         
         # 掩码对角线（自己与自己的相似度）
         mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
-        sim = sim.masked_fill(mask, -1e9)
+        sim = sim.masked_fill(mask, -1e4)  # ⬅️ 改成 -1e4（float16安全范围）
         
         # 正样本索引：第 i 个样本的正样本是第 i+B 个样本
         pos_idx = (torch.arange(2 * batch_size, device=z.device) + batch_size) % (2 * batch_size)
