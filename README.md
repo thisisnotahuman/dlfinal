@@ -148,3 +148,8 @@ class MyMethod(BaseSSLMethod):
 - 不同方法可以公平比较（相同 backbone、optimizer、eval）
 - 代码复用性高，维护简单
 
+## 下载test set
+```python
+python prepare_cub200_for_kaggle.py --download_dir ./raw_data --output_dir ./data
+
+```
