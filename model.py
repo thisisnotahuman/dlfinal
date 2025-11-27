@@ -1,4 +1,3 @@
-model1.py
 """
 具体方法实现 - 每个自监督学习方法的具体实现
 ==================================================
@@ -777,6 +776,196 @@ class VICReg(BaseSSLMethod):
         raise NotImplementedError("VICReg 尚未实现")
 
 
+class DINOv2(BaseSSLMethod):
+    """
+    DINOv2: Improved DINO with better training strategies
+    - Loss: student softmax 对齐 teacher softmax（有 temperature + centering）
+    - 机制: teacher 网络、centering、EMA 更新、multi-crop
+    - Backbone: 推荐使用 ViT-B/16 或 ViT-L/14
+    - 改进: 更好的训练策略和超参数设置
+    """
+    
+    def __init__(
+        self,
+        backbone: nn.Module,
+        feat_dim: int,
+        config: Dict[str, Any]
+    ):
+        super().__init__(backbone, feat_dim, config)
+        
+        # DINOv2 参数（优化的默认值）
+        self.momentum = config.get("momentum", 0.996)
+        self.temperature = config.get("temperature", 0.1)  # DINOv2 使用稍高的温度
+        self.temperature_teacher = config.get("temperature_teacher", 0.04)
+        self.center_momentum = config.get("center_momentum", 0.9)
+        self.warmup_teacher_temp = config.get("warmup_teacher_temp", 0.04)
+        self.warmup_teacher_temp_epochs = config.get("warmup_teacher_temp_epochs", 30)
+        
+        # 创建 teacher 网络
+        self.teacher_backbone = self._build_teacher_encoder()
+        self.teacher_head = self._build_teacher_head()
+        self._init_teacher()
+        
+        # Centering
+        proj_output_dim = self.config.get("proj_output_dim", 65536)
+        self.register_buffer("center", torch.zeros(1, proj_output_dim))
+        self.current_epoch = 0
+    
+    def _build_teacher_encoder(self) -> nn.Module:
+        """构建 teacher encoder"""
+        import copy
+        teacher = copy.deepcopy(self.backbone)
+        for param in teacher.parameters():
+            param.requires_grad = False
+        return teacher
+    
+    def _build_teacher_head(self) -> nn.Module:
+        """构建 teacher head"""
+        import copy
+        teacher_head = copy.deepcopy(self.head)
+        for param in teacher_head.parameters():
+            param.requires_grad = False
+        return teacher_head
+    
+    def _init_teacher(self):
+        """初始化 teacher 与 student 相同"""
+        for param_q, param_k in zip(self.backbone.parameters(), self.teacher_backbone.parameters()):
+            param_k.data.copy_(param_q.data)
+        for param_q, param_k in zip(self.head.parameters(), self.teacher_head.parameters()):
+            param_k.data.copy_(param_q.data)
+    
+    def build_head(self) -> nn.Module:
+        """构建 DINOv2 head（MLP projector，与 DINO 类似但可能使用不同维度）"""
+        proj_hidden_dim = self.config.get("proj_hidden_dim", 2048)
+        proj_output_dim = self.config.get("proj_output_dim", 65536)  # DINOv2 使用较大的输出维度
+        
+        projector = nn.Sequential(
+            nn.Linear(self.feat_dim, proj_hidden_dim),
+            nn.GELU(),
+            nn.Linear(proj_hidden_dim, proj_hidden_dim),
+            nn.GELU(),
+            nn.Linear(proj_hidden_dim, proj_output_dim),
+            nn.LayerNorm(proj_output_dim, eps=1e-6)
+        )
+        return projector
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """DINOv2 前向传播：只对齐 CLS token"""
+        # ViT 输出: [B, num_patches + 1, feat_dim] 或 [B, feat_dim]
+        h = self.backbone(x)
+        
+        # 如果是 ViT，取 CLS token
+        if len(h.shape) == 3:
+            h = h[:, 0]  # [B, feat_dim] CLS token
+        
+        if self.head is not None:
+            return self.head(h)
+        return h
+    
+    @torch.no_grad()
+    def _update_teacher(self):
+        """EMA 更新 teacher"""
+        for param_q, param_k in zip(self.backbone.parameters(), self.teacher_backbone.parameters()):
+            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+        for param_q, param_k in zip(self.head.parameters(), self.teacher_head.parameters()):
+            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+    
+    @torch.no_grad()
+    def _update_center(self, teacher_output: torch.Tensor):
+        """更新 centering"""
+        batch_center = torch.mean(teacher_output, dim=0, keepdim=True)
+        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+    
+    def _get_teacher_temp(self):
+        """获取 teacher temperature（带 warmup）"""
+        if self.current_epoch < self.warmup_teacher_temp_epochs:
+            return self.warmup_teacher_temp + (self.temperature_teacher - self.warmup_teacher_temp) * \
+                   (self.current_epoch / self.warmup_teacher_temp_epochs)
+        return self.temperature_teacher
+    
+    def compute_loss(
+        self,
+        views: torch.Tensor,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        计算 DINOv2 损失（multi-crop 支持）
+        
+        Args:
+            views: [B, num_views, 3, H, W] 多个视图（2 global + N local）
+        
+        Returns:
+            loss: 标量损失值
+            loss_dict: 损失分解字典
+        """
+        # 分离 global 和 local views
+        # 假设前 2 个是 global views，后面是 local views
+        num_global = 2
+        global_views = views[:, :num_global]  # [B, 2, 3, H, W]
+        local_views = views[:, num_global:] if views.size(1) > num_global else None  # [B, N_local, 3, H, W] 或 None
+        
+        # Student 处理所有 views
+        student_outputs = []
+        for i in range(views.size(1)):
+            x = views[:, i]  # [B, 3, H, W]
+            out = self.forward(x)
+            student_outputs.append(out)
+        
+        # Teacher 只处理 global views
+        teacher_outputs = []
+        with torch.no_grad():
+            for i in range(num_global):
+                x = global_views[:, i]  # [B, 3, H, W]
+                h = self.teacher_backbone(x)
+                if len(h.shape) == 3:
+                    h = h[:, 0]  # CLS token
+                out = self.teacher_head(h)
+                teacher_outputs.append(out)
+        
+        # 计算损失
+        total_loss = 0
+        num_losses = 0
+        
+        teacher_temp = self._get_teacher_temp()
+        
+        # Student 的每个输出与 teacher 的每个 global view 对齐
+        for student_out in student_outputs:
+            student_out = F.normalize(student_out, dim=1)
+            
+            for teacher_out in teacher_outputs:
+                # 更新 center
+                self._update_center(teacher_out)
+                
+                # Teacher 输出：centering + normalize
+                teacher_out = teacher_out - self.center
+                teacher_out = F.normalize(teacher_out, dim=1)
+                
+                # Softmax with temperature
+                student_logits = student_out / self.temperature
+                teacher_logits = teacher_out / teacher_temp
+                
+                # 交叉熵损失（KL divergence）
+                loss = -torch.sum(
+                    F.softmax(teacher_logits, dim=1) * F.log_softmax(student_logits, dim=1),
+                    dim=1
+                ).mean()
+                
+                total_loss += loss
+                num_losses += 1
+        
+        avg_loss = total_loss / max(1, num_losses)
+        
+        return avg_loss, {"loss": avg_loss.item()}
+    
+    def update_ema(self):
+        """更新 teacher 网络"""
+        self._update_teacher()
+    
+    def set_epoch(self, epoch: int):
+        """设置当前 epoch（用于 warmup）"""
+        self.current_epoch = epoch
+
+
 class MAE(BaseSSLMethod):
     """
     MAE: Masked Autoencoders
@@ -1106,10 +1295,10 @@ def build_method(
     构建自监督学习方法
     
     Args:
-        method_name: 方法名称（"simclr", "moco", "byol", "dino", "ibot", "vicreg", "mae"）
+        method_name: 方法名称（"simclr", "moco", "byol", "dino", "dinov2", "ibot", "vicreg", "mae"）
         backbone_type: backbone 类型（"resnet50" 或 "vit_b_16"）
         pretrained_backbone: 是否使用预训练 backbone
-        config: 方法特定的配置字典
+        config: 方法特定的配置字典（可以包含 image_size）
     
     Returns:
         method: 方法实例
@@ -1117,8 +1306,11 @@ def build_method(
     if config is None:
         config = {}
     
+    # 从 config 中获取 image_size（如果提供）
+    image_size = config.get("img_size", None)
+    
     # 构建 backbone
-    backbone, feat_dim = build_backbone(backbone_type, pretrained_backbone)
+    backbone, feat_dim = build_backbone(backbone_type, pretrained_backbone, image_size=image_size)
     
     # 创建方法实例
     method_classes = {
@@ -1126,6 +1318,7 @@ def build_method(
         "moco": MoCo,
         "byol": BYOL,
         "dino": DINO,
+        "dinov2": DINOv2,
         "ibot": IBOT,
         "vicreg": VICReg,
         "mae": MAE,

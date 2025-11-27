@@ -229,15 +229,43 @@ import torch
 import random
 
 # =============================
-# 本地文件 Dataset
+# 本地文件 Dataset（支持递归搜索子目录）
 # =============================
 class LocalImageDataset(Dataset):
-    def __init__(self, root_dir, base_transform):
+    def __init__(self, root_dir, base_transform, recursive=True):
+        """
+        Args:
+            root_dir: 图片文件夹路径
+            base_transform: 基础变换
+            recursive: 是否递归搜索子目录（默认 True）
+        """
         self.paths = []
-        for ext in ["jpg", "jpeg", "png"]:
-            self.paths.extend(glob(os.path.join(root_dir, f"*.{ext}")))
-        self.paths.sort()
         self.base_transform = base_transform
+        
+        # 支持的图片格式
+        extensions = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
+        
+        if recursive:
+            # 递归搜索所有子目录
+            for ext in extensions:
+                pattern = os.path.join(root_dir, "**", f"*.{ext}")
+                self.paths.extend(glob(pattern, recursive=True))
+        else:
+            # 只搜索根目录
+            for ext in extensions:
+                pattern = os.path.join(root_dir, f"*.{ext}")
+                self.paths.extend(glob(pattern, recursive=False))
+        
+        self.paths.sort()
+        
+        if len(self.paths) == 0:
+            raise ValueError(
+                f"未找到图片文件！\n"
+                f"  搜索路径: {root_dir}\n"
+                f"  递归搜索: {recursive}\n"
+                f"  支持的格式: {extensions}\n"
+                f"  请检查路径是否正确，或图片是否在子目录中（使用 recursive=True）"
+            )
 
     def __len__(self):
         return len(self.paths)
@@ -253,77 +281,149 @@ class LocalImageDataset(Dataset):
 # 高性能本地 DataLoader
 # =============================
 def load_dino_data(
-    dataset_root="/content/drive/MyDrive/fall2025_data/images",
+    dataset_type="local",
+    dataset_name=None,
+    dataset_root=None,
     img_size=96,
     batch_size=64,
     num_workers=8,
     train_sample=None,
     strength="strong",
-    dataset_type="local"
 ):
     """
-    dataset_root: 本地图片文件夹路径
+    加载数据集（支持 HuggingFace 和本地文件）
+    
+    Args:
+        dataset_type: "huggingface" 或 "local"
+        dataset_name: HuggingFace 数据集名称（dataset_type="huggingface" 时使用）
+        dataset_root: 本地图片文件夹路径（dataset_type="local" 时使用）
+        img_size: 图像尺寸
+        batch_size: 批次大小
+        num_workers: 数据加载线程数
+        train_sample: 训练集子集大小
+        strength: 增强强度
+    
+    Returns:
+        train_loader, eval_loader, base_transform, two_view_aug
     """
-
     print("=" * 60)
-    print("⚡ Loading LOCAL dataset with GPU-optimized pipeline")
+    print("⚡ Loading dataset with GPU-optimized pipeline")
     print("=" * 60)
 
     rng = random.Random(42)
 
     # --------------------------------------------------------
-    # 读取本地所有图片
+    # 读取数据集
     # --------------------------------------------------------
-    img_paths = []
-    for ext in ["jpg", "jpeg", "png"]:
-        img_paths.extend(glob(os.path.join(dataset_root, f"*.{ext}")))
-    img_paths.sort()
+    if dataset_type == "huggingface":
+        if dataset_name is None:
+            dataset_name = "tsbpp/fall2025_deeplearning"  # 默认值
+        from datasets import load_dataset as hf_load_dataset
+        dataset = hf_load_dataset(dataset_name)
+        base_train = dataset["train"]
+        print(f"✔ HF dataset loaded: {len(base_train)} images")
+        
+        # HuggingFace datasets 默认返回 PIL Image，无需额外设置格式
+        
+        # 使用原来的 DINODatasetGPU
+        base_transform = ms_transform(img_size)
+        train_dataset = DINODatasetGPU(base_train, base_transform)
+        
+    elif dataset_type == "local":
+        if dataset_root is None:
+            raise ValueError("dataset_root must be provided when dataset_type='local'")
+        
+        # 检查路径是否存在
+        if not os.path.exists(dataset_root):
+            raise ValueError(f"数据集路径不存在: {dataset_root}")
+        if not os.path.isdir(dataset_root):
+            raise ValueError(f"路径不是目录: {dataset_root}")
+        
+        print(f"✔ Loading local dataset from: {dataset_root}")
+        base_transform = ms_transform(img_size)
+        
+        # 尝试递归搜索（默认）
+        try:
+            full_dataset = LocalImageDataset(dataset_root, base_transform, recursive=True)
+        except ValueError as e:
+            # 如果递归搜索失败，尝试非递归
+            print(f"⚠️  递归搜索失败，尝试非递归搜索...")
+            full_dataset = LocalImageDataset(dataset_root, base_transform, recursive=False)
+        
+        train_dataset = full_dataset
+        print(f"✔ Found {len(full_dataset)} local images")
+        
+    elif dataset_type == "cifar10":
+        from torchvision.datasets import CIFAR10
+        base_train = CIFAR10("./data", train=True, download=True)
+        print(f"✔ CIFAR10 loaded: {len(base_train)} images")
+        base_transform = ms_transform(img_size)
+        train_dataset = DINODatasetGPU(base_train, base_transform)
+        
+    elif dataset_type == "cifar100":
+        from torchvision.datasets import CIFAR100
+        base_train = CIFAR100("./data", train=True, download=True)
+        print(f"✔ CIFAR100 loaded: {len(base_train)} images")
+        base_transform = ms_transform(img_size)
+        train_dataset = DINODatasetGPU(base_train, base_transform)
+        
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
-    total_imgs = len(img_paths)
-    print(f"✔ Found {total_imgs} local images")
-
     # --------------------------------------------------------
-    # train_sample
+    # train_sample 逻辑
     # --------------------------------------------------------
+    if len(train_dataset) == 0:
+        raise ValueError(
+            f"数据集为空！找不到任何图片文件。\n"
+            f"  请检查:\n"
+            f"  1. 路径是否正确: {dataset_root if dataset_type == 'local' else dataset_name}\n"
+            f"  2. 图片格式是否支持: jpg, jpeg, png\n"
+            f"  3. 如果图片在子目录中，确保使用递归搜索"
+        )
+    
     if train_sample is not None:
         train_sample = int(train_sample)
-        use_n = min(train_sample, total_imgs)
-        idxs = rng.sample(range(total_imgs), use_n)
-        img_paths_subset = [img_paths[i] for i in idxs]
-        print(f"✔ Using subset: {use_n}/{total_imgs} images")
+        total = len(train_dataset)
+        use_n = min(train_sample, total)
+        idxs = rng.sample(range(total), use_n)
+        train_dataset = Subset(train_dataset, idxs)
+        print(f"✔ Using train subset: {use_n}/{total} images")
     else:
-        img_paths_subset = img_paths
-        idxs = list(range(total_imgs))
-        print(f"✔ Using full local dataset: {total_imgs} images")
+        print(f"✔ Using full train set: {len(train_dataset)} images")
 
     # --------------------------------------------------------
-    # transform + augment
+    # 构建 transform 和 augment
     # --------------------------------------------------------
-    base_transform = ms_transform(img_size)
     two_view_aug = build_two_view_augment(img_size, strength)
 
-    # Dataset
-    full_dataset = LocalImageDataset(dataset_root, base_transform)
-
-    # Subset if needed
-    if train_sample is not None:
-        train_dataset = Subset(full_dataset, idxs)
-    else:
-        train_dataset = full_dataset
-
     # --------------------------------------------------------
-    # DataLoader
+    # 创建 DataLoader（GPU augment + 高速线程）
     # --------------------------------------------------------
+    # 优化配置：平衡 prefetch_factor 和 persistent_workers
+    if num_workers <= 8:
+        prefetch_factor = 4
+        use_persistent_workers = True
+    elif num_workers <= 16:
+        prefetch_factor = 3
+        use_persistent_workers = True
+    else: # num_workers > 16
+        prefetch_factor = 2
+        use_persistent_workers = False # 太多worker可能导致内存问题，禁用persistent_workers
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=use_persistent_workers,
         drop_last=True,
         collate_fn=collate_fn_cpu,
     )
+    
+    print(f"✔ DataLoader 配置: num_workers={num_workers}, prefetch_factor={prefetch_factor}, persistent_workers={use_persistent_workers}")
 
     print(f"✔ Train loader created: {len(train_loader)} batches")
     print("=" * 60)

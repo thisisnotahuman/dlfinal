@@ -199,6 +199,23 @@ def train_ssl(
 
             if use_wandb:
                 wandb.save(save_path)
+        
+        # 保存 latest checkpoint（每个 epoch 都保存）
+        latest_path = os.path.join(save_dir, "latest.pth")
+        ckpt = {
+            "epoch": epoch,
+            "model_state_dict": method.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "avg_loss": avg_loss,
+            "global_step": global_step,
+        }
+        if scheduler is not None:
+            ckpt["scheduler_state_dict"] = (
+                scheduler.scheduler.state_dict()
+                if hasattr(scheduler, "scheduler")
+                else scheduler.state_dict()
+            )
+        torch.save(ckpt, latest_path)
 
         # 保存 best 模型 & 早停逻辑
         if avg_loss < best_loss - early_stop_min_delta:
@@ -252,6 +269,18 @@ def main_train(args):
     """主训练函数"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🔥 设备: {device}")
+    
+    # 确定保存目录
+    if args.save_dir is None:
+        if args.exp_name:
+            args.save_dir = os.path.join("./checkpoints", args.exp_name)
+        else:
+            # 如果没有提供exp_name，使用默认命名
+            args.save_dir = os.path.join(
+                "./checkpoints",
+                f"{args.method}_{args.backbone_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+    print(f"📁 Checkpoint 保存目录: {args.save_dir}")
 
     # 初始化 wandb
     if args.use_wandb:
@@ -301,6 +330,7 @@ def main_train(args):
         "proj_hidden_dim": args.proj_hidden_dim,
         "proj_output_dim": args.proj_output_dim,
         "temperature": args.temperature,
+        "img_size": args.img_size,  # 传递给 backbone 构建函数，用于 ViT 的自定义图像尺寸
     }
 
     # 构建方法
@@ -367,7 +397,7 @@ def parse_args():
         "--method",
         type=str,
         default="simclr",
-        choices=["simclr", "moco", "byol", "dino", "ibot", "vicreg", "mae"],
+        choices=["simclr", "moco", "byol", "dino", "dinov2", "ibot", "vicreg", "mae"],
         help="自监督学习方法",
     )
 
@@ -412,7 +442,7 @@ def parse_args():
         "--backbone_type",
         type=str,
         default="resnet50",
-        choices=["resnet50", "vit_b_16"],
+        choices=["resnet50", "vit_s_16", "vit_b_16", "vit_s_14", "vit_b_14"],
     )
     parser.add_argument(
         "--pretrained_backbone",
@@ -450,7 +480,8 @@ def parse_args():
     )
 
     # 保存和日志
-    parser.add_argument("--save_dir", type=str, default="./checkpoints")
+    parser.add_argument("--exp_name", type=str, default=None, help="实验名称（用于命名checkpoint目录，例如：dinov2_vitb16_96px）")
+    parser.add_argument("--save_dir", type=str, default=None, help="保存目录（如果提供exp_name，会自动生成：./checkpoints/{exp_name}）")
     parser.add_argument("--save_freq", type=int, default=1)
     parser.add_argument("--log_freq", type=int, default=100)
     parser.add_argument("--use_wandb", action="store_true")

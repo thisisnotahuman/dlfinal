@@ -1,0 +1,5 @@
+# 忽略 checkpoints 文件夹
+checkpoints/
+
+# 忽略所有 PDF 文件
+*.pdf
