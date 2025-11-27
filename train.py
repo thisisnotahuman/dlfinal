@@ -37,7 +37,7 @@ def train_ssl(
     save_dir,
     two_view_aug,
     use_amp=True,
-    save_freq=1,
+    save_freq=None,
     log_freq=100,
     use_wandb=False,
     wandb_project="ssl-pretraining",
@@ -176,8 +176,8 @@ def train_ssl(
                 step=global_step,
             )
 
-        # 保存当前 epoch 的 checkpoint
-        if epoch % save_freq == 0 or epoch == epochs:
+        # 保存当前 epoch 的 checkpoint（仅在 save_freq 不为 None 时保存）
+        if save_freq is not None and (epoch % save_freq == 0 or epoch == epochs):
             ckpt = {
                 "epoch": epoch,
                 "model_state_dict": method.state_dict(),
@@ -216,6 +216,8 @@ def train_ssl(
                 else scheduler.state_dict()
             )
         torch.save(ckpt, latest_path)
+        if epoch == 1 or epoch % log_freq == 0:
+            print(f"💾 更新 Latest 模型到 {latest_path}")
 
         # 保存 best 模型 & 早停逻辑
         if avg_loss < best_loss - early_stop_min_delta:
@@ -237,7 +239,7 @@ def train_ssl(
                     else scheduler.state_dict()
                 )
             torch.save(ckpt, best_path)
-            print(f"🏅 更新 Best 模型（loss={best_loss:.4f}）")
+            print(f"🏅 更新 Best 模型（loss={best_loss:.4f}）到 {best_path}")
 
             if use_wandb:
                 wandb.run.summary["best_loss"] = best_loss
@@ -271,6 +273,11 @@ def main_train(args):
     print(f"🔥 设备: {device}")
     
     # 确定保存目录
+    print(f"🔍 路径处理调试信息:")
+    print(f"   传入的 --save_dir: {args.save_dir}")
+    print(f"   传入的 --exp_name: {args.exp_name}")
+    print(f"   当前工作目录: {os.getcwd()}")
+    
     if args.save_dir is None:
         if args.exp_name:
             args.save_dir = os.path.join("./checkpoints", args.exp_name)
@@ -280,7 +287,23 @@ def main_train(args):
                 "./checkpoints",
                 f"{args.method}_{args.backbone_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             )
-    print(f"📁 Checkpoint 保存目录: {args.save_dir}")
+    else:
+        # 如果提供了 save_dir，且也提供了 exp_name，则组合路径
+        if args.exp_name:
+            args.save_dir = os.path.join(args.save_dir, args.exp_name)
+            print(f"   组合后的路径（拼接后）: {args.save_dir}")
+    
+    # 转换为绝对路径，避免相对路径问题
+    # 如果已经是绝对路径，os.path.abspath() 会保持不变
+    original_save_dir = args.save_dir
+    args.save_dir = os.path.abspath(args.save_dir)
+    
+    print(f"📁 Checkpoint 保存目录（最终）: {args.save_dir}")
+    if original_save_dir != args.save_dir:
+        print(f"   ⚠️  路径已从相对路径转换为绝对路径")
+    print(f"   目录是否存在: {os.path.exists(args.save_dir)}")
+    if not os.path.exists(args.save_dir):
+        print(f"   ⚠️  目录不存在，将创建: {args.save_dir}")
 
     # 初始化 wandb
     if args.use_wandb:
@@ -482,7 +505,7 @@ def parse_args():
     # 保存和日志
     parser.add_argument("--exp_name", type=str, default=None, help="实验名称（用于命名checkpoint目录，例如：dinov2_vitb16_96px）")
     parser.add_argument("--save_dir", type=str, default=None, help="保存目录（如果提供exp_name，会自动生成：./checkpoints/{exp_name}）")
-    parser.add_argument("--save_freq", type=int, default=1)
+    parser.add_argument("--save_freq", type=int, default=None, help="保存频率（每 N 个 epoch 保存一次 epoch 特定的 checkpoint，默认 None 表示只保存 latest 和 best）")
     parser.add_argument("--log_freq", type=int, default=100)
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="ssl-pretraining")

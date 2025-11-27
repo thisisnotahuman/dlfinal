@@ -1,19 +1,19 @@
 #!/bin/bash
 
-# DINOv2 ViT-B/16 训练脚本
-# 实验名称：dinov2_vitb16_96px
+EXP_NAME="dinov2_vitb16_96px"
+SAVE_DIR="/root/autodl-tmp/checkpoints"
+CHECKPOINT_DIR="${SAVE_DIR}/${EXP_NAME}"
+LOG_DIR="./log"
+OUTPUT_FILE="${LOG_DIR}/${EXP_NAME}.out"
 
-EXP_NAME="dinov2_vits16_96px"
-CHECKPOINT_DIR="./checkpoints/${EXP_NAME}"
-OUTPUT_FILE="${CHECKPOINT_DIR}/${EXP_NAME}.out"
-
-# 创建 checkpoint 目录（如果不存在）
-mkdir -p ${CHECKPOINT_DIR}
+# 创建目录（如果不存在）
+mkdir -p ${CHECKPOINT_DIR}  # checkpoint 目录（在 /root/autodl-tmp/checkpoints/）
+mkdir -p ${LOG_DIR}         # 日志目录（在项目目录下）
 
 # 构建训练命令
 CMD="python train.py \
     --method dinov2 \
-    --backbone_type vit_s_16 \
+    --backbone_type vit_b_16 \
     --img_size 96 \
     --batch_size 512 \
     --epochs 50 \
@@ -27,11 +27,11 @@ CMD="python train.py \
     --proj_output_dim 65536 \
     --aug_strength strong \
     --use_amp \
-    --save_freq 10 \
     --log_freq 100 \
     --num_workers 8 \
     --dataset_type local \
     --dataset_root ../data \
+    --save_dir ${SAVE_DIR} \
     --exp_name ${EXP_NAME}"
 
 # 输出命令到日志文件
@@ -54,6 +54,7 @@ PID=$!
 echo "🚀 训练已启动！"
 echo "   实验名称: ${EXP_NAME}"
 echo "   进程ID: ${PID}"
+echo "   Checkpoint 目录: ${CHECKPOINT_DIR}"
 echo "   日志文件: ${OUTPUT_FILE}"
 echo "   查看日志: tail -f ${OUTPUT_FILE}"
 
