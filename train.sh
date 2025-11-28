@@ -1,6 +1,6 @@
 #!/bin/bash
 
-EXP_NAME="dinov2_vits16_96px"
+EXP_NAME="dinov2_vits14_96px_official"
 
 SAVE_DIR="/root/autodl-tmp/checkpoints"
 
@@ -12,8 +12,8 @@ OUTPUT_FILE="${LOG_DIR}/${EXP_NAME}.out"
 
 # 评估相关配置
 EVAL_CUB_DATA_DIR="/root/dl/eval_data/data"  # CUB 数据目录
-EVAL_FREQ=2                              # 每2个epoch评估一次
-EVAL_METHOD="knn"                        # 评估方法: knn 或 linear_probe
+EVAL_FREQ=5                              # 每5个epoch评估一次
+EVAL_METHOD="linear_probe"              # 评估方法: knn 或 linear_probe
 EVAL_KNN_K=20                            # k-NN 的 k 值
 EVAL_BATCH_SIZE=256                      # 评估时的批次大小
 EVAL_NUM_WORKERS=4                       # 评估时的数据加载线程数
@@ -29,11 +29,11 @@ mkdir -p ${LOG_DIR}         # 日志目录（在项目目录下）
 # 注意：这是针对 train from scratch 的优化配置
 CMD="python train.py \
     --method dinov2 \
-    --backbone_type vit_s_16 \
-    --img_size 96 \
-    --batch_size 2048 \
+    --backbone_type vit_s_14 \
+    --img_size 112 \
+    --batch_size 256 \
     --epochs 100 \
-    --lr 5e-4 \
+    --lr 1e-3 \
     --weight_decay 1e-4 \
     --optimizer_type adamw \
     --scheduler_type cosine \
@@ -44,7 +44,7 @@ CMD="python train.py \
     --aug_strength strong \
     --use_amp \
     --log_freq 100 \
-    --num_workers 12 \
+    --num_workers 8 \
     --dataset_type local \
     --dataset_root ../data \
     --save_dir ${SAVE_DIR} \
@@ -55,7 +55,8 @@ CMD="python train.py \
     --eval_method ${EVAL_METHOD} \
     --eval_knn_k ${EVAL_KNN_K} \
     --eval_batch_size ${EVAL_BATCH_SIZE} \
-    --eval_num_workers ${EVAL_NUM_WORKERS}"
+    --eval_num_workers ${EVAL_NUM_WORKERS} \
+    --eval_use_cls_token"
 
 # 如果启用禁用 tqdm，添加参数
 if [ "${DISABLE_TQDM}" = "true" ]; then

@@ -6,6 +6,7 @@
 
 import os
 import argparse
+import time
 from datetime import datetime
 
 import torch
@@ -45,6 +46,10 @@ def train_ssl(
     wandb_name=None,
     early_stop_patience=None,
     early_stop_min_delta=0.0001,
+    # 恢复训练参数
+    start_epoch=1,  # 从哪个 epoch 开始（用于恢复训练）
+    start_global_step=0,  # 从哪个 global_step 开始（用于恢复训练）
+    start_best_loss=float("inf"),  # 初始 best_loss（用于恢复训练）
     # 评估相关参数
     eval_enabled=False,
     eval_cub_data_dir=None,
@@ -108,12 +113,15 @@ def train_ssl(
         print(f"         CUB 数据路径: {eval_cub_data_dir}")
     print()
 
-    global_step = 0
-    best_loss = float("inf")
+    global_step = start_global_step  # ✅ 恢复训练：从指定 global_step 开始
+    best_loss = start_best_loss  # ✅ 恢复训练：从指定 best_loss 开始
     epochs_without_improvement = 0  # 早停计数器
 
     # Epoch 循环
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):  # ✅ 恢复训练：从指定 epoch 开始
+        # ✅ 添加：记录 epoch 开始时间
+        epoch_start_time = time.time()
+        
         method.train()
         epoch_loss = 0.0
         num_batches = 0
@@ -185,13 +193,14 @@ def train_ssl(
             
             # 检查梯度（用于调试）
             if global_step % log_freq == 0 and not use_amp:
+                # ✅ 性能优化：在 GPU 上计算梯度范数，最后只调用一次 .item()
                 # 计算梯度范数（仅在非 AMP 模式下，避免影响性能）
-                total_norm = 0.0
+                total_norm_sq = torch.tensor(0.0, device=device)
                 for p in method.parameters():
                     if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** (1. / 2)
+                        param_norm_sq = p.grad.data.norm(2) ** 2
+                        total_norm_sq = total_norm_sq + param_norm_sq
+                total_norm = (total_norm_sq ** 0.5).item()  # 只在最后调用一次 .item()
                 if total_norm > 0:
                     loss_dict["grad_norm"] = total_norm
 
@@ -226,10 +235,16 @@ def train_ssl(
             if scheduler is not None
             else optimizer.param_groups[0]["lr"]
         )
+        
+        # ✅ 添加：计算 epoch 耗时
+        epoch_time = time.time() - epoch_start_time
+        epoch_time_min = epoch_time / 60.0
+        epoch_time_sec = epoch_time % 60
 
         print(f"\n📌 Epoch {epoch}/{epochs}:")
         print(f"   avg_loss = {avg_loss:.4f}")
         print(f"   lr = {current_lr:.3e}")
+        print(f"   耗时 = {int(epoch_time_min)}分{int(epoch_time_sec)}秒 ({epoch_time:.2f}秒)")
 
         # Epoch 级别日志
         if use_wandb:
@@ -250,6 +265,7 @@ def train_ssl(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "avg_loss": avg_loss,
                 "global_step": global_step,
+                "best_loss": best_loss,  # ✅ 添加：保存 best_loss 以便恢复训练
             }
 
             if scheduler is not None:
@@ -274,6 +290,7 @@ def train_ssl(
             "optimizer_state_dict": optimizer.state_dict(),
             "avg_loss": avg_loss,
             "global_step": global_step,
+            "best_loss": best_loss,  # ✅ 添加：保存 best_loss 以便恢复训练
         }
         if scheduler is not None:
             ckpt["scheduler_state_dict"] = (
@@ -297,6 +314,7 @@ def train_ssl(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "avg_loss": avg_loss,
                 "global_step": global_step,
+                "best_loss": best_loss,  # ✅ 添加：保存 best_loss
             }
             if scheduler is not None:
                 ckpt["scheduler_state_dict"] = (
@@ -318,6 +336,9 @@ def train_ssl(
 
         # 评估（每 eval_freq 个 epoch）
         if eval_enabled and epoch % eval_freq == 0:
+            # ✅ 添加：记录评估开始时间
+            eval_start_time = time.time()
+            
             print(f"\n{'='*60}")
             print(f"📊 Epoch {epoch}: 开始评估...")
             print(f"{'='*60}")
@@ -337,8 +358,14 @@ def train_ssl(
                     disable_tqdm=disable_tqdm
                 )
                 
+                # ✅ 添加：计算评估耗时
+                eval_time = time.time() - eval_start_time
+                eval_time_min = eval_time / 60.0
+                eval_time_sec = eval_time % 60
+                
                 eval_accuracy = eval_results["accuracy"]
                 print(f"\n✅ Epoch {epoch} 评估完成: {eval_method} accuracy = {eval_accuracy:.4f} ({eval_accuracy*100:.2f}%)")
+                print(f"   评估耗时 = {int(eval_time_min)}分{int(eval_time_sec)}秒 ({eval_time:.2f}秒)")
                 
                 # 记录到 wandb
                 if use_wandb:
@@ -452,6 +479,10 @@ def main_train(args):
         )
 
     # 加载数据（这里合并本地 / HF 入口）
+    # 根据方法类型决定是否使用 multi-crop
+    use_multi_crop = args.method.lower() in ["dino", "dinov2", "ibot"]
+    num_local_crops = 8 if use_multi_crop else 0  # DINOv2 默认 8 个 local crops
+    
     train_loader, _, _, two_view_aug = load_dino_data(
         dataset_type=args.dataset_type,     # "local" 或 "huggingface"
         dataset_root=args.dataset_root,     # 本地时使用
@@ -461,6 +492,8 @@ def main_train(args):
         num_workers=args.num_workers,
         train_sample=args.train_sample,
         strength=args.aug_strength,
+        method=args.method,  # 传递方法类型
+        num_local_crops=num_local_crops,  # 传递 local crops 数量
     )
 
     # 构建方法配置
@@ -469,6 +502,7 @@ def main_train(args):
         "proj_output_dim": args.proj_output_dim,
         "temperature": args.temperature,
         "img_size": args.img_size,  # 传递给 backbone 构建函数，用于 ViT 的自定义图像尺寸
+        "total_epochs": args.epochs,  # ✅ 修复：传递给 DINOv2 用于 momentum cosine 调度
     }
 
     # 构建方法
@@ -498,6 +532,120 @@ def main_train(args):
         warmup_epochs=args.warmup_epochs,
     )
 
+    # ============================================================
+    # 恢复训练：从 checkpoint 加载
+    # ============================================================
+    start_epoch = 1
+    global_step = 0
+    best_loss = float("inf")
+    
+    if args.resume:
+        print("\n" + "="*60)
+        print(f"🔄 从 checkpoint 恢复训练: {args.resume}")
+        print("="*60)
+        
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Checkpoint 文件不存在: {args.resume}")
+        
+        checkpoint = torch.load(args.resume, map_location=device)
+        
+        # 加载模型
+        method.load_state_dict(checkpoint["model_state_dict"])
+        print("✅ 模型权重已加载")
+        
+        # 加载优化器
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print("✅ 优化器状态已加载")
+        
+        # 加载调度器
+        if "scheduler_state_dict" in checkpoint and scheduler is not None:
+            try:
+                if hasattr(scheduler, "scheduler"):
+                    scheduler.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                else:
+                    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                print("✅ 学习率调度器状态已加载")
+            except Exception as e:
+                print(f"⚠️  警告：无法加载调度器状态: {e}")
+                print("   将使用新的调度器状态继续训练")
+        
+        # 加载训练状态
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"] + 1  # 从下一个 epoch 开始
+            print(f"✅ 从 Epoch {start_epoch} 开始训练（已训练到 Epoch {checkpoint['epoch']}）")
+        
+        if "global_step" in checkpoint:
+            global_step = checkpoint["global_step"]
+            print(f"✅ Global step: {global_step}")
+        
+        if "avg_loss" in checkpoint:
+            print(f"✅ 上一个 epoch 的平均 loss: {checkpoint['avg_loss']:.4f}")
+        
+        if "best_loss" in checkpoint:
+            best_loss = checkpoint["best_loss"]
+            print(f"✅ Best loss: {best_loss:.4f}")
+        
+        # 如果 DINOv2 有 teacher 网络，需要确保 teacher 也被正确加载
+        if hasattr(method, 'teacher_backbone') and hasattr(method, 'teacher_head'):
+            print("✅ DINOv2 teacher 网络已随模型一起加载")
+        
+        print("="*60)
+        print()
+
+    # ============================================================
+    # 训练前检查：验证训练代码是否正确
+    # ============================================================
+    print("\n" + "="*60)
+    print("🔍 训练前检查：验证训练代码是否正确")
+    print("="*60)
+    
+    # 检查优化器：backbone 参数是否在优化器中
+    optimizer_param_ids = set(id(p) for group in optimizer.param_groups for p in group['params'])
+    backbone_param_ids = set(id(p) for p in method.backbone.parameters())
+    head_param_ids = set(id(p) for p in method.head.parameters())
+    
+    backbone_in_optimizer = len(backbone_param_ids & optimizer_param_ids) > 0
+    head_in_optimizer = len(head_param_ids & optimizer_param_ids) > 0
+    
+    print(f"📊 优化器参数检查：")
+    print(f"   Backbone 参数在优化器中: {'✅ 是' if backbone_in_optimizer else '❌ 否（这是严重问题！）'}")
+    print(f"   Head 参数在优化器中: {'✅ 是' if head_in_optimizer else '❌ 否（这是严重问题！）'}")
+    
+    if not backbone_in_optimizer:
+        print("\n⚠️  严重警告：Backbone 参数不在优化器中，不会被更新！")
+        print("   这会导致训练无效，准确率不会提升！")
+        print("   请检查代码，确保 backbone 参数被添加到优化器中。")
+    
+    # 检查梯度：backbone 是否有梯度
+    print(f"\n📊 梯度检查：")
+    method.train()
+    dummy_batch = torch.randn(2, 3, args.img_size, args.img_size).to(device)
+    views = torch.stack([dummy_batch, dummy_batch], dim=1)  # [2, 2, 3, H, W]
+    
+    optimizer.zero_grad()
+    loss, _ = method.compute_loss(views)
+    loss.backward()
+    
+    backbone_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in method.backbone.parameters())
+    head_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in method.head.parameters())
+    
+    print(f"   Backbone 有梯度: {'✅ 是' if backbone_has_grad else '❌ 否（这是严重问题！）'}")
+    print(f"   Head 有梯度: {'✅ 是' if head_has_grad else '❌ 否（这是严重问题！）'}")
+    
+    if not backbone_has_grad:
+        print("\n⚠️  严重警告：Backbone 没有梯度，梯度没有正确传播！")
+        print("   这会导致训练无效，准确率不会提升！")
+        print("   请检查代码，确保梯度能够传播到 backbone。")
+    
+    if backbone_in_optimizer and backbone_has_grad:
+        print("\n✅ 训练代码检查通过：Backbone 会被正确更新")
+    else:
+        print("\n❌ 训练代码检查失败：存在问题，需要修复！")
+    
+    print("="*60)
+    print()
+
     # 训练
     train_ssl(
         method=method,
@@ -516,6 +664,9 @@ def main_train(args):
         wandb_name=args.wandb_name,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
+        start_epoch=start_epoch,  # ✅ 添加：从指定 epoch 开始
+        start_global_step=global_step,  # ✅ 添加：从指定 global_step 开始
+        start_best_loss=best_loss,  # ✅ 添加：从指定 best_loss 开始
         # 评估参数
         eval_enabled=args.eval_enabled,
         eval_cub_data_dir=args.eval_cub_data_dir,
@@ -651,6 +802,14 @@ def parse_args():
         type=float,
         default=0.0001,
         help="早停最小改善阈值",
+    )
+    
+    # 恢复训练
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="恢复训练的 checkpoint 路径（例如：./checkpoints/exp_name/latest.pth 或 ./checkpoints/exp_name/epoch_010.pth）",
     )
 
     # 评估参数

@@ -55,7 +55,8 @@ def extract_features(
         for batch in iterator:
             if isinstance(batch, (list, tuple)) and len(batch) == 2:
                 images, batch_labels = batch
-                labels.extend(batch_labels.cpu().numpy())
+                # ✅ 性能优化：在 GPU 上累积标签，最后一次性移到 CPU
+                labels.append(batch_labels)  # 保持在 GPU 上
             else:
                 images = batch
                 if isinstance(images, (list, tuple)):
@@ -91,9 +92,11 @@ def extract_features(
                 # 重新归一化
                 feat = F.normalize(feat, dim=1)
             
-            features.append(feat.cpu())
+            # ✅ 性能优化：在 GPU 上累积特征，最后一次性移到 CPU
+            features.append(feat)  # 保持在 GPU 上
     
-    features = torch.cat(features, dim=0).numpy()
+    # ✅ 性能优化：在 GPU 上拼接，然后一次性移到 CPU
+    features = torch.cat(features, dim=0).cpu().numpy()
     
     # 最终检查 NaN
     if np.isnan(features).any() or np.isinf(features).any():
@@ -104,7 +107,16 @@ def extract_features(
         norms = np.where(norms == 0, 1.0, norms)  # 避免除以0
         features = features / norms
     
-    labels = np.array(labels) if labels else None
+    # ✅ 性能优化：如果有标签，在 GPU 上拼接后一次性移到 CPU
+    if labels and len(labels) > 0:
+        if isinstance(labels[0], torch.Tensor):
+            # 标签是 GPU tensor，在 GPU 上拼接
+            labels = torch.cat(labels, dim=0).cpu().numpy()
+        else:
+            # 标签已经是 numpy，直接转换
+            labels = np.array(labels)
+    else:
+        labels = None
     
     return features, labels
 

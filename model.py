@@ -781,7 +781,7 @@ class DINOv2(BaseSSLMethod):
     DINOv2: Improved DINO with better training strategies
     - Loss: student softmax 对齐 teacher softmax（有 temperature + centering）
     - 机制: teacher 网络、centering、EMA 更新、multi-crop
-    - Backbone: 推荐使用 ViT-B/16 或 ViT-L/14
+    - Backbone: 推荐使用 ViT-S/14（按实现说明）
     - 改进: 更好的训练策略和超参数设置
     """
     
@@ -793,13 +793,18 @@ class DINOv2(BaseSSLMethod):
     ):
         super().__init__(backbone, feat_dim, config)
         
-        # DINOv2 参数（优化的默认值）
-        self.momentum = config.get("momentum", 0.996)
-        self.temperature = config.get("temperature", 0.1)  # DINOv2 使用稍高的温度
-        self.temperature_teacher = config.get("temperature_teacher", 0.04)
+        # DINOv2 参数（按实现说明）
+        self.momentum = config.get("momentum", 0.996)  # 用于兼容，实际使用 momentum_start
+        self.temperature = config.get("temperature", 0.1)  # T_student = 0.1
+        self.temperature_teacher = config.get("temperature_teacher", 0.04)  # T_teacher = 0.04（固定）
         self.center_momentum = config.get("center_momentum", 0.9)
         self.warmup_teacher_temp = config.get("warmup_teacher_temp", 0.04)
         self.warmup_teacher_temp_epochs = config.get("warmup_teacher_temp_epochs", 30)
+        
+        # ✅ 修复：Teacher momentum 的 cosine 调度参数
+        self.momentum_start = config.get("momentum", 0.996)
+        self.momentum_end = config.get("momentum_end", 1.0)
+        self.total_epochs = config.get("total_epochs", 100)  # 需要从训练循环传入
         
         # 创建 teacher 网络
         self.teacher_backbone = self._build_teacher_encoder()
@@ -807,7 +812,7 @@ class DINOv2(BaseSSLMethod):
         self._init_teacher()
         
         # Centering
-        proj_output_dim = self.config.get("proj_output_dim", 65536)
+        proj_output_dim = self.config.get("proj_output_dim", 256)  # ✅ 修复：改为 256
         self.register_buffer("center", torch.zeros(1, proj_output_dim))
         self.current_epoch = 0
     
@@ -835,22 +840,32 @@ class DINOv2(BaseSSLMethod):
             param_k.data.copy_(param_q.data)
     
     def build_head(self) -> nn.Module:
-        """构建 DINOv2 head（MLP projector，与 DINO 类似但可能使用不同维度）"""
-        proj_hidden_dim = self.config.get("proj_hidden_dim", 2048)
-        proj_output_dim = self.config.get("proj_output_dim", 65536)  # DINOv2 使用较大的输出维度
+        """
+        构建 DINOv2 head（MLP projector）
         
+        ✅ 修复：按实现说明，使用两层MLP：384→2048→256
+        - 输入：CLS token 特征 (B, 384)
+        - 输出：L2-normalized 特征 (B, 256)
+        """
+        proj_hidden_dim = self.config.get("proj_hidden_dim", 2048)
+        proj_output_dim = self.config.get("proj_output_dim", 256)  # ✅ 修复：改为 256（不是 65536）
+        
+        # ✅ 修复：两层MLP（不是三层）
+        # 说明要求：384 → 2048 → 256，最后L2归一化
         projector = nn.Sequential(
-            nn.Linear(self.feat_dim, proj_hidden_dim),
+            nn.Linear(self.feat_dim, proj_hidden_dim),  # 384 → 2048
             nn.GELU(),
-            nn.Linear(proj_hidden_dim, proj_hidden_dim),
-            nn.GELU(),
-            nn.Linear(proj_hidden_dim, proj_output_dim),
-            nn.LayerNorm(proj_output_dim, eps=1e-6)
+            nn.Linear(proj_hidden_dim, proj_output_dim),  # 2048 → 256
+            # 注意：L2归一化在 forward 中动态计算，不在 Sequential 中
         )
         return projector
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """DINOv2 前向传播：只对齐 CLS token"""
+        """
+        DINOv2 前向传播：只对齐 CLS token
+        
+        ✅ 修复：按实现说明，输出需要L2归一化
+        """
         # ViT 输出: [B, num_patches + 1, feat_dim] 或 [B, feat_dim]
         h = self.backbone(x)
         
@@ -859,16 +874,35 @@ class DINOv2(BaseSSLMethod):
             h = h[:, 0]  # [B, feat_dim] CLS token
         
         if self.head is not None:
-            return self.head(h)
+            out = self.head(h)  # [B, proj_output_dim]
+            # ✅ 修复：按实现说明，对输出做L2归一化
+            out = F.normalize(out, p=2, dim=1)  # L2归一化到单位向量
+            return out
         return h
     
     @torch.no_grad()
     def _update_teacher(self):
-        """EMA 更新 teacher"""
+        """
+        EMA 更新 teacher
+        
+        ✅ 修复：按实现说明，使用 cosine schedule 的 momentum
+        m(epoch) = 1 - (1 - m_start) * (cos(π * epoch / total_epochs) + 1) / 2
+        """
+        # 计算当前 epoch 的 momentum（cosine schedule）
+        if hasattr(self, 'total_epochs') and self.total_epochs > 0:
+            import math
+            progress = self.current_epoch / max(1, self.total_epochs)
+            momentum = 1 - (1 - self.momentum_start) * (math.cos(math.pi * progress) + 1) / 2
+            # 确保 momentum 在 [momentum_start, momentum_end] 范围内
+            momentum = max(self.momentum_start, min(self.momentum_end, momentum))
+        else:
+            # 如果没有设置 total_epochs，使用固定 momentum
+            momentum = self.momentum
+        
         for param_q, param_k in zip(self.backbone.parameters(), self.teacher_backbone.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+            param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
         for param_q, param_k in zip(self.head.parameters(), self.teacher_head.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+            param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
     
     @torch.no_grad()
     def _update_center(self, teacher_output: torch.Tensor):
@@ -893,25 +927,26 @@ class DINOv2(BaseSSLMethod):
         
         Args:
             views: [B, num_views, 3, H, W] 多个视图（2 global + N local）
+                   或 List[Tensor]（如果 views 尺寸不同，如 DINOv2 官方做法）
         
         Returns:
             loss: 标量损失值
             loss_dict: 损失分解字典
         """
-        # 分离 global 和 local views
-        # 假设前 2 个是 global views，后面是 local views
+        # ✅ 修复：按实现说明，所有视图都是统一尺寸，views 是 tensor
+        # views: [B, num_views, 3, H, W]，其中 num_views = 2 (global) + 6 (local) = 8
         num_global = 2
         global_views = views[:, :num_global]  # [B, 2, 3, H, W]
-        local_views = views[:, num_global:] if views.size(1) > num_global else None  # [B, N_local, 3, H, W] 或 None
+        local_views = views[:, num_global:] if views.size(1) > num_global else None  # [B, 6, 3, H, W] 或 None
         
-        # Student 处理所有 views
+        # Student 处理所有 views（2 global + 6 local = 8 个）
         student_outputs = []
         for i in range(views.size(1)):
             x = views[:, i]  # [B, 3, H, W]
-            out = self.forward(x)
+            out = self.forward(x)  # 已经 L2-normalized
             student_outputs.append(out)
         
-        # Teacher 只处理 global views
+        # Teacher 只处理 global views（2 个）
         teacher_outputs = []
         with torch.no_grad():
             for i in range(num_global):
@@ -920,6 +955,8 @@ class DINOv2(BaseSSLMethod):
                 if len(h.shape) == 3:
                     h = h[:, 0]  # CLS token
                 out = self.teacher_head(h)
+                # ✅ 修复：teacher 输出也需要 L2 归一化
+                out = F.normalize(out, p=2, dim=1)
                 teacher_outputs.append(out)
         
         # 计算损失
@@ -933,16 +970,17 @@ class DINOv2(BaseSSLMethod):
             student_out = F.normalize(student_out, dim=1)
             
             for teacher_out in teacher_outputs:
-                # 更新 center
+                # 更新 center（在计算 softmax 前）
                 self._update_center(teacher_out)
                 
-                # Teacher 输出：centering + normalize
-                teacher_out = teacher_out - self.center
-                teacher_out = F.normalize(teacher_out, dim=1)
+                # ✅ 修复：按实现说明，计算 softmax
+                # Student: p_student = softmax(student_logits / T_student)
+                # Teacher: p_teacher = softmax((teacher_logits - center) / T_teacher)
+                # Teacher 输出：centering（在 softmax 前减去 center）
+                teacher_out_centered = teacher_out - self.center
                 
-                # Softmax with temperature（添加数值稳定性保护）
-                student_logits = student_out / self.temperature
-                teacher_logits = teacher_out / teacher_temp
+                student_logits = student_out / self.temperature  # T_student = 0.1
+                teacher_logits = teacher_out_centered / teacher_temp  # T_teacher = 0.04
                 
                 # 防止数值溢出：clip logits 到合理范围
                 # 对于 float16 (AMP)，需要更小的范围；对于 float32，可以更大
@@ -1324,8 +1362,13 @@ def build_method(
     # 从 config 中获取 image_size（如果提供）
     image_size = config.get("img_size", None)
     
-    # 构建 backbone
-    backbone, feat_dim = build_backbone(backbone_type, pretrained_backbone, image_size=image_size)
+    # 构建 backbone（传递 method_name 以判断是否使用 DINOv2 官方实现）
+    backbone, feat_dim = build_backbone(
+        backbone_type, 
+        pretrained_backbone, 
+        image_size=image_size,
+        method_name=method_name
+    )
     
     # 创建方法实例
     method_classes = {

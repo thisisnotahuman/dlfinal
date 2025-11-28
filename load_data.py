@@ -9,6 +9,7 @@
 """
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision.transforms.v2 as v2
 from torchvision.models import ResNeXt50_32X4D_Weights
@@ -25,15 +26,25 @@ def build_two_view_augment(
     strength="strong",
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
+    method="simclr",  # 新增：方法类型
+    num_local_crops=0,  # 新增：local crops 数量（DINOv2 使用）
 ):
     """
+    构建双视图或多视图增强
+    
     输入： x = [B, 3, H, W]，float32 GPU，已经是 [0, 1] 范围（经过 ToTensor）
-    输出： [B, 2, 3, H, W]，normalize 后的图像
+    输出： 
+        - SimCLR: [B, 2, 3, H, W]
+        - DINOv2: [B, 2+num_local_crops, 3, H, W]（前2个是global，后面是local）
     
     流程：
     1. 输入已经是 [0, 1] 范围（从 ms_transform 的 ToTensor 得到）
     2. 在 [0, 1] 范围上进行增强操作
     3. 最后 normalize 到目标分布
+    
+    DINOv2 官方 multi-crop 规范：
+    - Global crops (2个): 尺寸 224, crop scale (0.4, 1.0), 用于 teacher + student
+    - Local crops (6-10个): 尺寸 96, crop scale (0.05, 0.4), 仅用于 student
     """
     
     if strength.lower() not in {"strong", "medium", "weak"}:
@@ -51,43 +62,130 @@ def build_two_view_augment(
     std_t = torch.tensor(std).view(1, 3, 1, 1)
     
     # 增强配置
+    # DINOv2 官方要求：
+    # - Global view 1: blur p=1.0, solarize p=0
+    # - Global view 2: blur p=0.0, solarize p=0.2
+    # - Local crops: blur p=0.5, solarize p=0
+    is_dinov2 = method.lower() in ["dino", "dinov2", "ibot"]
+    
     if strength == "strong":
-        aug_cfg = dict(
-            use_rrc=True,
-            cj=(0.8, 0.8, 0.8, 0.2),
-            p_cj=0.8,
-            p_gray=0.2,
-            blur_p1=1.0,
-            blur_p2=0.1,
-            solarize_p2=0.2,
-        )
+        if is_dinov2:
+            # DINOv2 官方配置
+            aug_cfg = dict(
+                use_rrc=True,
+                cj=(0.8, 0.8, 0.8, 0.2),
+                p_cj=0.8,
+                p_gray=0.2,
+                blur_p1=1.0,  # Global view 1: blur p=1.0
+                blur_p2=0.0,  # ✅ 修复：Global view 2: blur p=0.0（不是 0.1）
+                solarize_p2=0.2,  # Global view 2: solarize p=0.2
+                blur_p_local=0.5,  # ✅ 新增：Local crops: blur p=0.5
+                solarize_p_local=0.0,  # ✅ 新增：Local crops: solarize p=0
+            )
+        else:
+            # SimCLR 或其他方法的配置
+            aug_cfg = dict(
+                use_rrc=True,
+                cj=(0.8, 0.8, 0.8, 0.2),
+                p_cj=0.8,
+                p_gray=0.2,
+                blur_p1=1.0,
+                blur_p2=0.1,
+                solarize_p2=0.2,
+            )
     elif strength == "medium":
-        aug_cfg = dict(
-            use_rrc=False,
-            cj=(0.4, 0.4, 0.3, 0.1),
-            p_cj=0.7,
-            p_gray=0.15,
-            blur_p1=0.6,
-            blur_p2=0.1,
-            solarize_p2=0.0,
-        )
+        if is_dinov2:
+            # DINOv2 官方配置（medium 强度时也遵循相同模式）
+            aug_cfg = dict(
+                use_rrc=True,
+                cj=(0.4, 0.4, 0.3, 0.1),
+                p_cj=0.7,
+                p_gray=0.15,
+                blur_p1=1.0,  # Global view 1: blur p=1.0
+                blur_p2=0.0,  # ✅ 修复：Global view 2: blur p=0.0
+                solarize_p2=0.2,  # Global view 2: solarize p=0.2
+                blur_p_local=0.5,  # Local crops: blur p=0.5
+                solarize_p_local=0.0,  # Local crops: solarize p=0
+            )
+        else:
+            aug_cfg = dict(
+                use_rrc=True,
+                cj=(0.4, 0.4, 0.3, 0.1),
+                p_cj=0.7,
+                p_gray=0.15,
+                blur_p1=0.6,
+                blur_p2=0.1,
+                solarize_p2=0.0,
+            )
     else:  # weak
-        aug_cfg = dict(
-            use_rrc=False,
-            cj=(0.3, 0.3, 0.2, 0.05),
-            p_cj=0.5,
-            p_gray=0.1,
-            blur_p1=0.3,
-            blur_p2=0.0,
-            solarize_p2=0.0,
-        )
+        if is_dinov2:
+            # DINOv2 官方配置（weak 强度时也遵循相同模式）
+            aug_cfg = dict(
+                use_rrc=True,
+                cj=(0.3, 0.3, 0.2, 0.05),
+                p_cj=0.5,
+                p_gray=0.1,
+                blur_p1=1.0,  # Global view 1: blur p=1.0
+                blur_p2=0.0,  # ✅ 修复：Global view 2: blur p=0.0
+                solarize_p2=0.2,  # Global view 2: solarize p=0.2
+                blur_p_local=0.5,  # Local crops: blur p=0.5
+                solarize_p_local=0.0,  # Local crops: solarize p=0
+            )
+        else:
+            aug_cfg = dict(
+                use_rrc=True,
+                cj=(0.3, 0.3, 0.2, 0.05),
+                p_cj=0.5,
+                p_gray=0.1,
+                blur_p1=0.3,
+                blur_p2=0.0,
+                solarize_p2=0.0,
+            )
+    if is_dinov2:
+        # DINOv2 官方规范（ImageNet 224x224）：
+        # - Global crops (2个): 尺寸 224, crop scale (0.4, 1.0), 用于 teacher + student
+        # - Local crops (6-10个): 尺寸 96, crop scale (0.05, 0.4), 仅用于 student
+        # - 比例关系：Global 224 / Local 96 ≈ 2.33
+        
+        # ✅ 修复：根据原始图像尺寸自适应调整
+        # 如果原始数据是 96x96，按比例：
+        # - Global crops: 96x96（从 96x96 中 crop，scale (0.4, 1.0)）
+        # - Local crops: 应该更小，比如 32x32 或 48x48（保持比例关系）
+        global_crop_scale = (0.4, 1.0)  # ✅ DINOv2 官方 global crop scale
+        
+        # ✅ 修复：按实现说明，所有视图（包括local）应该统一尺寸为 img_size
+        # 说明要求：所有视图都是 112×112（适配后），包括 local
+        # 但 local 的 crop scale 更小 (0.1~0.5)，然后 resize 到统一尺寸
+        # 这样既保持了多尺度信息，又统一了输入尺寸
+        if img_size >= 224:
+            # 标准 DINOv2 配置：local crop 96，但 resize 到 224
+            local_crop_size = 96
+        else:
+            # 对于较小的 img_size（如 96），local crop 也 resize 到 img_size
+            # 使用更小的 crop size 来 crop，然后 resize 到 img_size
+            # 这样可以保持多尺度信息，同时统一输入尺寸
+            local_crop_size = max(32, img_size // 3)  # 至少 32×32，然后 resize 到 img_size
+        
+        local_crop_scale = (0.05, 0.4)  # ✅ DINOv2 官方 local crop scale
+        if num_local_crops == 0:
+            num_local_crops = 6  # ✅ 修复：按实现说明，使用 6 个 local crops（不是 8 个）
+        
+        print(f"📐 DINOv2 crop 配置: Global={img_size}×{img_size}, Local crop={local_crop_size}×{local_crop_size}→resize到{img_size}×{img_size}（统一尺寸）")
+    else:
+        # SimCLR 或其他：使用原来的 scale
+        global_crop_scale = (0.2, 1.0)
+        local_crop_size = img_size // 3  # 不使用，但定义以避免错误
+        local_crop_scale = (0.05, 0.2)
+        num_local_crops = 0  # SimCLR 不使用 local crops
     
     # 构建增强 pipeline（在 [0, 1] 范围上操作）
-    def build_pipeline(view_idx: int):
+    def build_global_pipeline(view_idx: int):
+        """构建 global crop 的增强 pipeline"""
         ops = []
         
         if aug_cfg["use_rrc"]:
-            ops.append(v2.RandomResizedCrop(img_size, scale=(0.2, 1.0)))
+            # 使用正确的 crop scale
+            ops.append(v2.RandomResizedCrop(img_size, scale=global_crop_scale))
         else:
             ops.extend([
                 v2.Resize(img_size),
@@ -125,8 +223,42 @@ def build_two_view_augment(
         
         return v2.Compose(ops)
     
-    pip_v1 = build_pipeline(0)
-    pip_v2 = build_pipeline(1)
+    def build_local_pipeline():
+        """构建 local crop 的增强 pipeline（更弱的增强）"""
+        ops = []
+        
+        # Local crop: 使用更小的 scale
+        ops.append(v2.RandomResizedCrop(local_crop_size, scale=local_crop_scale))
+        ops.append(v2.RandomHorizontalFlip(0.5))
+        
+        # Local crops 使用更弱的颜色抖动
+        if aug_cfg["p_cj"] > 0:
+            cj_weak = tuple(x * 0.5 for x in aug_cfg["cj"])
+            ops.append(v2.RandomApply(
+                [v2.ColorJitter(*cj_weak)],
+                p=aug_cfg["p_cj"] * 0.5
+            ))
+        
+        # ✅ DINOv2 官方要求：Local crops 使用 blur p=0.5
+        if is_dinov2 and "blur_p_local" in aug_cfg:
+            blur_p_local = aug_cfg.get("blur_p_local", 0.5)
+            if blur_p_local > 0:
+                k = max(3, int(0.1 * local_crop_size) // 2 * 2 + 1)
+                ops.append(v2.RandomApply(
+                    [v2.GaussianBlur(kernel_size=k, sigma=(0.1, 2.0))],
+                    p=blur_p_local
+                ))
+        
+        # ✅ DINOv2 官方要求：Local crops 不使用 solarize (p=0)
+        # 已经在 aug_cfg 中设置为 0，不需要添加
+        
+        return v2.Compose(ops)
+    
+    pip_v1 = build_global_pipeline(0)
+    pip_v2 = build_global_pipeline(1)
+    
+    if is_dinov2 and num_local_crops > 0:
+        local_pip = build_local_pipeline()
     
     def apply(x):
         """
@@ -134,7 +266,8 @@ def build_two_view_augment(
             x: [B, 3, H, W]，[0, 1] 范围的 tensor（GPU）
         
         Returns:
-            [B, 2, 3, H, W]，normalize 后的两个视图
+            SimCLR: [B, 2, 3, H, W]（两个都是 img_size×img_size）
+            DINOv2: [B, 2+num_local_crops, 3, H, W]（所有视图都是 img_size×img_size，统一尺寸）
         """
         device = x.device
         mean_base = base_mean.to(device)
@@ -143,23 +276,50 @@ def build_two_view_augment(
         std_custom = std_t.to(device)
         
         # 输入 x 已经是 [0, 1] 范围（从 ToTensor 得到）
-        # 如果之前被 normalize 过，需要先反 normalize（但当前流程不会 normalize）
-        # 这里为了兼容性，先确保在 [0, 1] 范围
         x = torch.clamp(x, 0.0, 1.0)
         
-        # 在 [0, 1] 范围上进行增强
-        v1 = pip_v1(x)  # [B, 3, H, W]
-        v2 = pip_v2(x)  # [B, 3, H, W]
+        views = []
         
-        # 确保在 [0, 1] 范围（增强操作可能略微超出）
+        # 生成 2 个 global crops
+        v1 = pip_v1(x)  # [B, 3, img_size, img_size]
+        v2 = pip_v2(x)  # [B, 3, img_size, img_size]
         v1 = torch.clamp(v1, 0.0, 1.0)
         v2 = torch.clamp(v2, 0.0, 1.0)
-        
-        # Normalize 到目标分布
         v1 = (v1 - mean_custom) / std_custom
         v2 = (v2 - mean_custom) / std_custom
+        views.append(v1)
+        views.append(v2)
         
-        return torch.stack([v1, v2], dim=1)  # [B, 2, 3, H, W]
+        # DINOv2: 生成 local crops
+        if is_dinov2 and num_local_crops > 0:
+            for _ in range(num_local_crops):
+                v_local = local_pip(x)  # [B, 3, local_crop_size, local_crop_size]
+                v_local = torch.clamp(v_local, 0.0, 1.0)
+                
+                # ✅ 修复：按实现说明，所有视图（包括local）应该统一尺寸为 img_size
+                # Local crop 从更小的区域 crop（scale 0.1~0.5），然后 resize 到 img_size
+                # 这样既保持了多尺度信息，又统一了输入尺寸，便于 stack
+                try:
+                    v_local = F.interpolate(
+                        v_local,  # [B, 3, local_crop_size, local_crop_size]
+                        size=(img_size, img_size),
+                        mode='bilinear',
+                        align_corners=False,
+                        antialias=True
+                    )  # [B, 3, img_size, img_size]
+                except TypeError:
+                    # 如果 antialias 不支持，使用不带 antialias 的版本
+                    v_local = F.interpolate(
+                        v_local,
+                        size=(img_size, img_size),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                v_local = (v_local - mean_custom) / std_custom
+                views.append(v_local)  # [B, 3, img_size, img_size]（统一尺寸）
+        
+        # 堆叠所有 views（现在所有 views 都是统一尺寸，可以 stack）
+        return torch.stack(views, dim=1)  # [B, 2+num_local_crops, 3, img_size, img_size]
     
     return apply
 
@@ -169,10 +329,17 @@ def build_two_view_augment(
 # ============================================================
 
 def ms_transform(img_size=96):
-    """基础变换：只做 resize 和 to_tensor，不 normalize"""
+    """
+    基础变换：resize + to_tensor，不 normalize
+    
+    ✅ 说明：如果原始数据是 96×96，而 img_size=112，会自动上采样到 112×112
+    - v2.Resize(img_size) 会将图像 resize 到指定尺寸（上采样或下采样）
+    - v2.CenterCrop(img_size) 确保输出尺寸为 img_size×img_size
+    - 这样 112 可以被 patch_size=14 整除，patch grid 是 8×8，没有像素丢失
+    """
     return v2.Compose([
-        v2.Resize(img_size),
-        v2.CenterCrop(img_size),
+        v2.Resize(img_size),  # 如果原始是 96×96，img_size=112，会上采样到 112×112
+        v2.CenterCrop(img_size),  # 确保输出是 img_size×img_size
         v2.ToTensor(),  # 转换为 [0, 1] 范围的 tensor
         # 注意：不在这里 normalize，normalize 在增强后做
     ])
@@ -289,6 +456,8 @@ def load_dino_data(
     num_workers=8,
     train_sample=None,
     strength="strong",
+    method="simclr",  # 新增：方法类型，用于选择正确的增强策略
+    num_local_crops=0,  # 新增：local crops 数量（DINOv2 使用）
 ):
     """
     加载数据集（支持 HuggingFace 和本地文件）
@@ -395,7 +564,12 @@ def load_dino_data(
     # --------------------------------------------------------
     # 构建 transform 和 augment
     # --------------------------------------------------------
-    two_view_aug = build_two_view_augment(img_size, strength)
+    two_view_aug = build_two_view_augment(
+        img_size, 
+        strength,
+        method=method,
+        num_local_crops=num_local_crops
+    )
 
     # --------------------------------------------------------
     # 创建 DataLoader（GPU augment + 高速线程）
