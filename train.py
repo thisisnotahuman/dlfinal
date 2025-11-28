@@ -21,6 +21,7 @@ from utils import (
     save_checkpoint,  # 目前没用到，但先留着
     count_parameters
 )
+from eval import evaluate_on_cub
 
 
 # ============================================================
@@ -44,6 +45,18 @@ def train_ssl(
     wandb_name=None,
     early_stop_patience=None,
     early_stop_min_delta=0.0001,
+    # 评估相关参数
+    eval_enabled=False,
+    eval_cub_data_dir=None,
+    eval_freq=2,  # 每 N 个 epoch 评估一次
+    eval_method="knn",
+    eval_knn_k=20,
+    eval_linear_probe_C=1.0,
+    eval_use_cls_token=False,
+    eval_batch_size=256,
+    eval_num_workers=4,
+    img_size=96,  # 图像尺寸（用于评估）
+    disable_tqdm=False,  # 是否禁用 tqdm 进度条
 ):
     """
     通用自监督学习训练循环
@@ -65,6 +78,17 @@ def train_ssl(
         wandb_name: wandb 运行名称
         early_stop_patience: 早停耐心值（连续多少个epoch没有改善则停止），None表示不使用早停
         early_stop_min_delta: 早停最小改善阈值
+        eval_enabled: 是否启用评估
+        eval_cub_data_dir: CUB 数据文件夹路径（eval_enabled=True 时必需）
+        eval_freq: 评估频率（每 N 个 epoch 评估一次）
+        eval_method: 评估方法，"knn" 或 "linear_probe"
+        eval_knn_k: k-NN 的 k 值
+        eval_linear_probe_C: Linear Probe 的正则化强度
+        eval_use_cls_token: 是否使用 CLS token（仅 ViT）
+        eval_batch_size: 评估时的批次大小
+        eval_num_workers: 评估时的数据加载线程数
+        img_size: 图像尺寸（用于评估）
+        disable_tqdm: 是否禁用 tqdm 进度条
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -79,6 +103,9 @@ def train_ssl(
         print(f"   Wandb: ✅ {wandb_project}/{wandb_name}")
     if early_stop_patience is not None:
         print(f"   早停: ✅ patience={early_stop_patience}, min_delta={early_stop_min_delta}")
+    if eval_enabled:
+        print(f"   评估: ✅ 每 {eval_freq} 个 epoch 在 CUB-200-2011 上评估 ({eval_method})")
+        print(f"         CUB 数据路径: {eval_cub_data_dir}")
     print()
 
     global_step = 0
@@ -92,7 +119,10 @@ def train_ssl(
         num_batches = 0
 
         # 进度条
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", ncols=100)
+        if disable_tqdm:
+            pbar = train_loader
+        else:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", ncols=100)
 
         for batch in pbar:
             # 将 batch 移到设备并做两视图增强
@@ -115,12 +145,35 @@ def train_ssl(
                 with autocast():
                     loss, loss_dict = method.compute_loss(views)
 
+                # 检查 loss 是否为 NaN/Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"⚠️  Warning: NaN/Inf loss detected at step {global_step}, skipping this batch")
+                    continue  # 跳过这个 batch
+                
                 scaler.scale(loss).backward()
+                
+                # 检查梯度是否有 inf/nan（必须在 step 之前）
+                scaler.unscale_(optimizer)
+                
+                # 检查梯度是否有 inf/nan
+                grad_norm = torch.nn.utils.clip_grad_norm_(method.parameters(), max_norm=1.0)
+                
+                # 如果梯度有 inf/nan，scaler 会跳过 step
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss, loss_dict = method.compute_loss(views)
+                
+                # 检查 loss 是否为 NaN/Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"⚠️  Warning: NaN/Inf loss detected at step {global_step}, skipping this batch")
+                    continue  # 跳过这个 batch
+                
                 loss.backward()
+                
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(method.parameters(), max_norm=1.0)
+                
                 optimizer.step()
 
             # 更新 EMA（如果有 teacher 网络）
@@ -129,11 +182,24 @@ def train_ssl(
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
+            
+            # 检查梯度（用于调试）
+            if global_step % log_freq == 0 and not use_amp:
+                # 计算梯度范数（仅在非 AMP 模式下，避免影响性能）
+                total_norm = 0.0
+                for p in method.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+                if total_norm > 0:
+                    loss_dict["grad_norm"] = total_norm
 
             # Step 级别日志
             if global_step % log_freq == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
-                pbar.set_postfix({**loss_dict, "lr": f"{current_lr:.2e}"})
+                if not disable_tqdm:
+                    pbar.set_postfix({**loss_dict, "lr": f"{current_lr:.2e}"})
 
                 if use_wandb:
                     wandb.log(
@@ -250,6 +316,44 @@ def train_ssl(
             if early_stop_patience is not None:
                 print(f"⚠️  Loss 没有改善 ({epochs_without_improvement}/{early_stop_patience})")
 
+        # 评估（每 eval_freq 个 epoch）
+        if eval_enabled and epoch % eval_freq == 0:
+            print(f"\n{'='*60}")
+            print(f"📊 Epoch {epoch}: 开始评估...")
+            print(f"{'='*60}")
+            try:
+                eval_results = evaluate_on_cub(
+                    method=method,
+                    cub_data_dir=eval_cub_data_dir,
+                    device=device,
+                    img_size=img_size,
+                    batch_size=eval_batch_size,
+                    num_workers=eval_num_workers,
+                    eval_method=eval_method,
+                    use_cls_token=eval_use_cls_token,
+                    knn_k=eval_knn_k,
+                    linear_probe_C=eval_linear_probe_C,
+                    verbose=True,
+                    disable_tqdm=disable_tqdm
+                )
+                
+                eval_accuracy = eval_results["accuracy"]
+                print(f"\n✅ Epoch {epoch} 评估完成: {eval_method} accuracy = {eval_accuracy:.4f} ({eval_accuracy*100:.2f}%)")
+                
+                # 记录到 wandb
+                if use_wandb:
+                    wandb.log(
+                        {
+                            f"eval/{eval_method}_accuracy": eval_accuracy,
+                            "epoch": epoch,
+                        },
+                        step=global_step,
+                    )
+            except Exception as e:
+                print(f"⚠️  评估失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
         # 早停检查
         if (
             early_stop_patience is not None
@@ -269,6 +373,17 @@ def train_ssl(
 
 def main_train(args):
     """主训练函数"""
+    # 验证评估参数
+    if args.eval_enabled:
+        if args.eval_cub_data_dir is None:
+            raise ValueError("--eval_cub_data_dir 必须提供（当 --eval_enabled 时）")
+        from pathlib import Path
+        cub_path = Path(args.eval_cub_data_dir)
+        if not cub_path.exists():
+            raise ValueError(f"CUB 数据路径不存在: {args.eval_cub_data_dir}")
+        if not (cub_path / "train").exists() or not (cub_path / "val").exists():
+            raise ValueError(f"CUB 数据路径格式不正确，应包含 train/ 和 val/ 文件夹: {args.eval_cub_data_dir}")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🔥 设备: {device}")
     
@@ -401,6 +516,18 @@ def main_train(args):
         wandb_name=args.wandb_name,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
+        # 评估参数
+        eval_enabled=args.eval_enabled,
+        eval_cub_data_dir=args.eval_cub_data_dir,
+        eval_freq=args.eval_freq,
+        eval_method=args.eval_method,
+        eval_knn_k=args.eval_knn_k,
+        eval_linear_probe_C=args.eval_linear_probe_C,
+        eval_use_cls_token=args.eval_use_cls_token,
+        eval_batch_size=args.eval_batch_size,
+        eval_num_workers=args.eval_num_workers,
+        img_size=args.img_size,
+        disable_tqdm=args.disable_tqdm,
     )
 
     # 关闭 wandb
@@ -524,6 +651,68 @@ def parse_args():
         type=float,
         default=0.0001,
         help="早停最小改善阈值",
+    )
+
+    # 评估参数
+    parser.add_argument(
+        "--eval_enabled",
+        action="store_true",
+        help="是否启用评估（在 CUB-200-2011 上每 N 个 epoch 评估一次）",
+    )
+    parser.add_argument(
+        "--eval_cub_data_dir",
+        type=str,
+        default=None,
+        help="CUB-200-2011 数据文件夹路径（包含 train/val/test，eval_enabled=True 时必需）",
+    )
+    parser.add_argument(
+        "--eval_freq",
+        type=int,
+        default=2,
+        help="评估频率（每 N 个 epoch 评估一次，默认 2）",
+    )
+    parser.add_argument(
+        "--eval_method",
+        type=str,
+        default="knn",
+        choices=["knn", "linear_probe"],
+        help="评估方法：knn 或 linear_probe",
+    )
+    parser.add_argument(
+        "--eval_knn_k",
+        type=int,
+        default=20,
+        help="k-NN 评估的 k 值",
+    )
+    parser.add_argument(
+        "--eval_linear_probe_C",
+        type=float,
+        default=1.0,
+        help="Linear Probe 的正则化强度",
+    )
+    parser.add_argument(
+        "--eval_use_cls_token",
+        action="store_true",
+        help="是否使用 CLS token（仅 ViT）",
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=256,
+        help="评估时的批次大小",
+    )
+    parser.add_argument(
+        "--eval_num_workers",
+        type=int,
+        default=4,
+        help="评估时的数据加载线程数",
+    )
+
+    # 其他参数
+    parser.add_argument(
+        "--disable_tqdm",
+        action="store_true",
+        help="禁用 tqdm 进度条（适用于非交互式环境或日志文件）",
     )
 
     return parser.parse_args()

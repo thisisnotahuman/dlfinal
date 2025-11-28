@@ -92,6 +92,13 @@ class BaseSSLMethod(nn.Module, ABC):
             features: 方法特定的输出
         """
         h = self.backbone(x)
+        
+        # 处理 ViT 的 3D 输出：如果是 [B, num_patches+1, feat_dim]，取 CLS token
+        # 这是为了兼容性，确保所有方法都能正确处理 ViT backbone
+        if len(h.shape) == 3:
+            # ViT 输出: [B, num_patches+1, feat_dim]，第 0 个是 CLS token
+            h = h[:, 0]  # [B, feat_dim]
+        
         if self.head is not None:
             return self.head(h)
         return h

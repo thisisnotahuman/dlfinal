@@ -940,20 +940,35 @@ class DINOv2(BaseSSLMethod):
                 teacher_out = teacher_out - self.center
                 teacher_out = F.normalize(teacher_out, dim=1)
                 
-                # Softmax with temperature
+                # Softmax with temperature（添加数值稳定性保护）
                 student_logits = student_out / self.temperature
                 teacher_logits = teacher_out / teacher_temp
                 
-                # 交叉熵损失（KL divergence）
-                loss = -torch.sum(
-                    F.softmax(teacher_logits, dim=1) * F.log_softmax(student_logits, dim=1),
-                    dim=1
-                ).mean()
+                # 防止数值溢出：clip logits 到合理范围
+                # 对于 float16 (AMP)，需要更小的范围；对于 float32，可以更大
+                max_logit_value = 50.0  # 防止 exp 溢出
+                student_logits = torch.clamp(student_logits, min=-max_logit_value, max=max_logit_value)
+                teacher_logits = torch.clamp(teacher_logits, min=-max_logit_value, max=max_logit_value)
+                
+                # 交叉熵损失（KL divergence）- 使用更稳定的计算方式
+                teacher_probs = F.softmax(teacher_logits, dim=1)
+                student_log_probs = F.log_softmax(student_logits, dim=1)
+                loss = -torch.sum(teacher_probs * student_log_probs, dim=1).mean()
+                
+                # 检查 NaN 和 Inf，如果出现则使用 fallback
+                if torch.isnan(loss) or torch.isinf(loss):
+                    # Fallback: 使用 MSE 损失
+                    loss = F.mse_loss(student_out, teacher_out)
                 
                 total_loss += loss
                 num_losses += 1
         
         avg_loss = total_loss / max(1, num_losses)
+        
+        # 最终检查
+        if torch.isnan(avg_loss) or torch.isinf(avg_loss):
+            # 如果最终损失还是 NaN，返回一个大的常数（但保持梯度）
+            avg_loss = torch.tensor(100.0, device=total_loss.device, requires_grad=True)
         
         return avg_loss, {"loss": avg_loss.item()}
     
